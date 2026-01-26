@@ -1,23 +1,31 @@
-// Upload Photo - AI-Powered Segmentation with Meta's SAM 2
-// Uses Replicate API for Segment Anything Model 2 with click-based segmentation
+
+// Upload Photo - AI-Powered Segmentation
+// Uses multiple AI backends with fallback for reliability:
+// 1. Primary: fal.ai (Florence-2 + SAM for text-guided segmentation)
+// 2. Fallback: Replicate API (Meta SAM-2 automatic segmentation)
 
 console.log('Upload Photo module loading...');
 
 // ============= CONFIGURATION =============
-// Using Meta's SAM 2 Video - supports click coordinates for point-based segmentation
-// We send the image as a single frame and click coordinates to segment specific objects
-const REPLICATE_MODEL = "meta/sam-2-video";
-const REPLICATE_SAM_VERSION = "33432afdfc06a10da6b4018932893d39b0159f838b6d11dd1236dff85cc5ec1d";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const SUPPORTED_FORMATS = ['image/jpeg', 'image/png', 'image/webp'];
 
-// CORS proxy for development (Replicate doesn't allow direct browser calls)
-// For production, you should set up your own backend proxy
+// fal.ai API (primary - fast, reliable, text-to-segment)
+// Using Florence-2 + SAM for text-guided segmentation
+const FAL_API_URL = 'https://fal.run/fal-ai/florence-sam';
+
+// Replicate API - using Grounded SAM for text-based segmentation
+// Supports mask_prompt (what to select) and negative_mask_prompt (what to exclude)
+const REPLICATE_MODEL = "schananas/grounded_sam";
+const REPLICATE_VERSION = "ee871c19efb1941f55f66a3d7d960428c8a5afcb77449547fe8e5a3ab9ebc21c";
+
+// CORS proxy for development
 const USE_CORS_PROXY = true;
 const CORS_PROXY_URL = 'https://corsproxy.io/?';
 
 // ============= STATE =============
 let apiKey = localStorage.getItem('replicate_api_key') || '';
+let falApiKey = localStorage.getItem('fal_api_key') || '';
 let uploadedImage = null;
 let uploadedImageDataUrl = null;
 let photoCanvas, photoCtx;
@@ -29,7 +37,10 @@ let isProcessing = false;
 
 // For multi-click refinement
 let currentClickPoints = []; // Array of {x, y, label} for accumulating clicks
-let videoDataUrlCache = null; // Cache the video so we don't recreate it each time
+
+// For mask selection UI
+let availableMasks = []; // Store multiple mask options from SAM
+let selectedMaskIndex = 1; // Default to "part" mask (index 1)
 
 // ============= INITIALIZATION =============
 document.addEventListener('DOMContentLoaded', () => {
@@ -172,52 +183,43 @@ function loadImageToCanvas(dataUrl) {
 }
 
 // ============= CANVAS INTERACTION =============
+// Store click coordinates for point-based segmentation
+let lastClickX = 0;
+let lastClickY = 0;
+
 function setupCanvasClickHandler() {
     const wrapper = document.querySelector('.canvas-wrapper');
     if (!wrapper) return;
 
-    // Left click = add to selection (positive point)
+    // Click on canvas = capture click position and open prompt dialog
     wrapper.addEventListener('click', async (e) => {
         if (isProcessing) return;
         if (e.button !== 0) return; // Only left click
 
+        // Get click position relative to the canvas
         const rect = maskCanvas.getBoundingClientRect();
+        const clickX = e.clientX - rect.left;
+        const clickY = e.clientY - rect.top;
+
+        // Convert to canvas coordinates (accounting for CSS scaling)
         const scaleX = maskCanvas.width / rect.width;
         const scaleY = maskCanvas.height / rect.height;
+        lastClickX = Math.round(clickX * scaleX);
+        lastClickY = Math.round(clickY * scaleY);
 
-        const x = Math.round((e.clientX - rect.left) * scaleX);
-        const y = Math.round((e.clientY - rect.top) * scaleY);
+        console.log(`Click at canvas coords: (${lastClickX}, ${lastClickY})`);
 
-        console.log(`Left click (add) at canvas coordinates: (${x}, ${y})`);
+        // Show click indicator
+        showClickIndicator(clickX, clickY, true);
 
-        // Show click indicator (green for add)
-        showClickIndicator(e.clientX - rect.left, e.clientY - rect.top, true);
-
-        // Add positive point and process
-        currentClickPoints.push({ x, y, label: 1 });
-        await processMultiClickWithSAM();
+        // Open the prompt dialog to let user specify what they want to select
+        showPromptDialog();
     });
 
-    // Right click = remove from selection (negative point)
+    // Right click - could be used to specify exclusions in future
     wrapper.addEventListener('contextmenu', async (e) => {
-        e.preventDefault(); // Prevent context menu
-        if (isProcessing) return;
-
-        const rect = maskCanvas.getBoundingClientRect();
-        const scaleX = maskCanvas.width / rect.width;
-        const scaleY = maskCanvas.height / rect.height;
-
-        const x = Math.round((e.clientX - rect.left) * scaleX);
-        const y = Math.round((e.clientY - rect.top) * scaleY);
-
-        console.log(`Right click (remove) at canvas coordinates: (${x}, ${y})`);
-
-        // Show click indicator (red for remove)
-        showClickIndicator(e.clientX - rect.left, e.clientY - rect.top, false);
-
-        // Add negative point and process
-        currentClickPoints.push({ x, y, label: 0 });
-        await processMultiClickWithSAM();
+        e.preventDefault();
+        alert('Tip: Left-click on the area you want to select, then choose a description.');
     });
 }
 
@@ -237,56 +239,87 @@ function showClickIndicator(x, y, isPositive = true) {
     }, 500);
 }
 
-// ============= SAM INTEGRATION =============
-// Multi-click segmentation using SAM 2
-// Accumulates positive (left click) and negative (right click) points
-async function processMultiClickWithSAM() {
-    // Check for API key
-    if (!apiKey) {
-        const modal = document.getElementById('api-modal');
-        if (modal) modal.classList.remove('hidden');
+// ============= AI SEGMENTATION INTEGRATION =============
+// Text-prompt based segmentation using CLIPSeg (Hugging Face) or Grounded SAM (Replicate)
+// Much more accurate for architectural elements like "brick wall", "stone pillar", etc.
+
+// Store the current text prompts for refinement
+let currentPositivePrompt = '';
+let currentNegativePrompt = '';
+
+async function processWithTextPromptAI(maskPrompt, negativePrompt = '') {
+    if (!maskPrompt || maskPrompt.trim() === '') {
+        alert('Please specify what you want to select (e.g., "brick wall", "stone")');
         return;
     }
 
-    if (currentClickPoints.length === 0) return;
-
     isProcessing = true;
-    const pointCount = currentClickPoints.length;
-    const positiveCount = currentClickPoints.filter(p => p.label === 1).length;
-    const negativeCount = currentClickPoints.filter(p => p.label === 0).length;
+    currentPositivePrompt = maskPrompt;
+    currentNegativePrompt = negativePrompt;
 
-    showLoading(true, `Refining selection (${positiveCount} include, ${negativeCount} exclude)...`);
+    showLoading(true, `Detecting "${maskPrompt}"...`);
 
     try {
-        // Call Replicate API with all click points
-        const mask = await callReplicateSAMWithMultipleClicks(currentClickPoints);
+        let masks = null;
+        let usedAPI = '';
 
-        if (mask) {
-            // Save to history for undo
-            saveMaskToHistory();
+        // Try fal.ai first (fast, text-to-segment with Florence-2 + SAM)
+        if (falApiKey) {
+            try {
+                console.log('Trying fal.ai Florence-SAM...');
+                showLoading(true, `Detecting "${maskPrompt}" with AI...`);
+                masks = await callFalAI(maskPrompt);
+                usedAPI = 'fal.ai';
+            } catch (falError) {
+                console.warn('fal.ai failed:', falError.message);
+            }
+        }
 
-            // Clear mask canvas first, then apply new mask
-            maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        // Fallback to Replicate if fal.ai failed and we have a Replicate key
+        if (!masks && apiKey) {
+            console.log('Falling back to Replicate SAM-2...');
+            showLoading(true, `Detecting "${maskPrompt}" with SAM-2...\n(This may take a moment on first use)`);
+            masks = await callReplicateSAM(maskPrompt, negativePrompt);
+            usedAPI = 'replicate';
+        }
 
-            // Apply mask
-            addMaskToSelection(mask, `${positiveCount} clicks (+${positiveCount}/-${negativeCount})`);
+        // If still no masks and no API keys, show error
+        if (!masks) {
+            // Show API modal to get keys
+            const modal = document.getElementById('api-modal');
+            if (modal) modal.classList.remove('hidden');
+            throw new Error('Please add an API key to use AI segmentation.');
+        }
 
-            // Update UI
-            updateAreasPanel();
-            updateContinueButton();
+        if (masks && masks.length > 0) {
+            // Store available masks
+            availableMasks = masks;
+            console.log(`${usedAPI} returned ${masks.length} mask(s)`);
+
+            // Grounded SAM returns a single mask based on text prompt
+            // Apply it directly since it's text-guided and should be accurate
+            if (masks.length === 1) {
+                saveMaskToHistory();
+                maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+                await addMaskToSelection(masks[0], maskPrompt);
+                updateAreasPanel();
+                updateContinueButton();
+            } else if (masks.length > 1) {
+                // Multiple masks - show selection UI
+                showMaskSelectionUI(masks, maskPrompt);
+            }
+        } else {
+            alert(`Could not detect "${maskPrompt}" in the image. Try a different description like "brick", "stone wall", or "building facade".`);
         }
     } catch (error) {
-        console.error('SAM processing error:', error);
-
-        // Remove the last click point since it failed
-        currentClickPoints.pop();
+        console.error('AI segmentation error:', error);
 
         // Provide more helpful error messages
         let errorMessage = 'Error processing image. ';
         if (error.message.includes('401')) {
-            errorMessage += 'Invalid API key. Please check your Replicate token.';
+            errorMessage += 'Invalid API key. Please check your token.';
         } else if (error.message.includes('402')) {
-            errorMessage += 'Billing issue with Replicate account.';
+            errorMessage += 'Billing issue with your account.';
         } else if (error.message.includes('429')) {
             errorMessage += 'Too many requests. Please wait a moment.';
         } else if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
@@ -304,154 +337,102 @@ async function processMultiClickWithSAM() {
     }
 }
 
-// Legacy text prompt handler - kept for prompt dialog
+// Legacy function name for compatibility
+async function processWithGroundedSAM(maskPrompt, negativePrompt = '') {
+    return processWithTextPromptAI(maskPrompt, negativePrompt);
+}
+
+// Wrapper for backward compatibility
 async function processWithTextPrompt(maskPrompt, negativePrompt = '') {
-    // For text prompts, we'll use the center of the image as a default click
-    // This is a fallback - the main interaction should be click-based
-    const centerX = Math.round(maskCanvas.width / 2);
-    const centerY = Math.round(maskCanvas.height / 2);
-
-    // Show a message that text prompts work differently now
-    alert('Tip: For best results, click directly on the area you want to select. The AI will detect the entire object you clicked on.');
-
-    // Still process with a center click as fallback
-    await processClickWithSAM(centerX, centerY, true);
+    await processWithTextPromptAI(maskPrompt, negativePrompt);
 }
 
-// Convert image to a short WebM video for SAM-2-video API
-async function imageToVideoDataUrl() {
-    return new Promise((resolve, reject) => {
-        // Create a temporary canvas
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = photoCanvas.width;
-        tempCanvas.height = photoCanvas.height;
-        const tempCtx = tempCanvas.getContext('2d');
+// ============= FAL.AI FLORENCE-SAM API =============
+// Florence-2 + SAM: Text-guided semantic segmentation (fast, reliable)
+async function callFalAI(textPrompt) {
+    console.log('Calling fal.ai Florence-SAM API...');
+    console.log('Prompt:', textPrompt);
 
-        // Draw the image
-        tempCtx.drawImage(uploadedImage, 0, 0, tempCanvas.width, tempCanvas.height);
+    const fetchUrl = USE_CORS_PROXY
+        ? CORS_PROXY_URL + encodeURIComponent(FAL_API_URL)
+        : FAL_API_URL;
 
-        // Check if MediaRecorder supports webm
-        const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-            ? 'video/webm;codecs=vp9'
-            : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-            ? 'video/webm;codecs=vp8'
-            : 'video/webm';
+    const requestBody = {
+        image_url: uploadedImageDataUrl,
+        prompts: textPrompt
+    };
 
-        console.log('Using video mimeType:', mimeType);
-
-        // Create a video stream from canvas
-        const stream = tempCanvas.captureStream(1); // 1 FPS
-        const mediaRecorder = new MediaRecorder(stream, {
-            mimeType: mimeType,
-            videoBitsPerSecond: 2500000
-        });
-
-        const chunks = [];
-
-        mediaRecorder.ondataavailable = (e) => {
-            if (e.data.size > 0) {
-                chunks.push(e.data);
-            }
-        };
-
-        mediaRecorder.onstop = () => {
-            const blob = new Blob(chunks, { type: mimeType });
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                console.log('Video created, size:', blob.size, 'bytes');
-                resolve(reader.result);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        };
-
-        mediaRecorder.onerror = (e) => {
-            console.error('MediaRecorder error:', e);
-            reject(e);
-        };
-
-        // Record for 100ms (just need 1-2 frames)
-        mediaRecorder.start();
-
-        // Draw a few frames to ensure we have content
-        let frameCount = 0;
-        const drawFrame = () => {
-            tempCtx.drawImage(uploadedImage, 0, 0, tempCanvas.width, tempCanvas.height);
-            frameCount++;
-            if (frameCount < 5) {
-                requestAnimationFrame(drawFrame);
-            } else {
-                // Stop after a few frames
-                setTimeout(() => {
-                    mediaRecorder.stop();
-                }, 200);
-            }
-        };
-        drawFrame();
+    const response = await fetch(fetchUrl, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Key ${falApiKey}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
     });
-}
 
-// Call SAM 2 with multiple click coordinates for refined segmentation
-async function callReplicateSAMWithMultipleClicks(clickPoints) {
-    // Build the API URL (with optional CORS proxy)
-    const apiUrl = 'https://api.replicate.com/v1/predictions';
-    const fetchUrl = USE_CORS_PROXY ? CORS_PROXY_URL + encodeURIComponent(apiUrl) : apiUrl;
+    console.log('fal.ai Response status:', response.status);
 
-    console.log('Calling SAM 2 API with multiple clicks...', clickPoints);
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error('fal.ai Error:', errorText);
+        throw new Error(`fal.ai failed: ${response.status}`);
+    }
 
-    // Convert image to video format (cache it for subsequent calls)
-    if (!videoDataUrlCache) {
-        showLoading(true, 'Preparing image...');
-        try {
-            videoDataUrlCache = await imageToVideoDataUrl();
-            console.log('Video data URL created and cached, length:', videoDataUrlCache.length);
-        } catch (videoError) {
-            console.warn('Could not create video, trying with image directly:', videoError);
-            videoDataUrlCache = uploadedImageDataUrl;
+    const data = await response.json();
+    console.log('fal.ai response:', data);
+
+    // fal.ai florence-sam returns results array with mask_url
+    if (data.results && data.results.length > 0) {
+        const maskUrls = data.results.map(r => r.mask_url).filter(Boolean);
+        if (maskUrls.length > 0) {
+            const maskImages = await Promise.all(maskUrls.map(url => loadMaskImage(url)));
+            return maskImages;
         }
     }
 
-    // Build coordinate strings from all click points
-    // Format: '[x1,y1],[x2,y2],[x3,y3]'
-    const coordsArray = clickPoints.map(p => `[${p.x},${p.y}]`);
-    const clickCoordinates = coordsArray.join(',');
+    throw new Error('No masks found in fal.ai response');
+}
 
-    // Format labels: '1,0,1,0' etc.
-    const clickLabels = clickPoints.map(p => p.label).join(',');
+// Helper to convert dataURL to Blob
+async function dataURLtoBlob(dataURL) {
+    const response = await fetch(dataURL);
+    return await response.blob();
+}
 
-    // All clicks are on frame 0
-    const clickFrames = clickPoints.map(() => '0').join(',');
+// ============= REPLICATE GROUNDED SAM API =============
+// Uses schananas/grounded_sam for text-based segmentation
+// Supports mask_prompt (what to select) and negative_mask_prompt (what to exclude)
+async function callReplicateSAM(maskPrompt, negativePrompt = '') {
+    // Use version-based API endpoint
+    const apiUrl = 'https://api.replicate.com/v1/predictions';
+    const fetchUrl = USE_CORS_PROXY ? CORS_PROXY_URL + encodeURIComponent(apiUrl) : apiUrl;
 
-    // All clicks belong to the same object
-    const clickObjectIds = clickPoints.map(() => 'wall').join(',');
+    console.log('Calling Replicate Grounded SAM API with text prompt...');
+    console.log('Model:', REPLICATE_MODEL);
+    console.log('Version:', REPLICATE_VERSION);
+    console.log('Text prompt:', maskPrompt);
+    console.log('Negative prompt:', negativePrompt);
 
-    console.log('Click coordinates:', clickCoordinates);
-    console.log('Click labels:', clickLabels);
-
-    // SAM 2 Video input format:
-    // input_video: the video file
-    // click_coordinates: '[x,y],[x,y]' format
-    // click_labels: '1,0,1' for foreground/background mix
-    // click_frames: '0,0,0' (all on first frame)
-    // mask_type: 'binary' or 'highlighted'
-
+    // Grounded SAM input with text prompts
+    // mask_prompt: what to select (e.g., "brick wall", "stone pillar")
+    // negative_mask_prompt: what to exclude (optional)
     const input = {
-        input_video: videoDataUrlCache,
-        click_coordinates: clickCoordinates,
-        click_labels: clickLabels,
-        click_frames: clickFrames,
-        click_object_ids: clickObjectIds,
-        mask_type: 'binary',  // Binary mask for cleaner extraction
-        output_video: false,
-        output_format: 'png'
+        image: uploadedImageDataUrl,
+        mask_prompt: maskPrompt,
+        adjustment_factor: 0
     };
 
-    console.log('SAM 2 Input (truncated):', {
+    // Add negative prompt if provided
+    if (negativePrompt) {
+        input.negative_mask_prompt = negativePrompt;
+    }
+
+    console.log('Grounded SAM Input (image truncated):', {
         ...input,
-        input_video: input.input_video.substring(0, 100) + '...'
+        image: input.image.substring(0, 100) + '...'
     });
 
-    // Create prediction
     const createResponse = await fetch(fetchUrl, {
         method: 'POST',
         headers: {
@@ -459,7 +440,7 @@ async function callReplicateSAMWithMultipleClicks(clickPoints) {
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            version: REPLICATE_SAM_VERSION,
+            version: REPLICATE_VERSION,
             input: input
         })
     });
@@ -473,6 +454,7 @@ async function callReplicateSAMWithMultipleClicks(clickPoints) {
             const error = JSON.parse(errorText);
             throw new Error(error.detail || `API request failed: ${createResponse.status}`);
         } catch (e) {
+            if (e.message.includes('API request failed')) throw e;
             throw new Error(`API request failed: ${createResponse.status} - ${errorText.substring(0, 100)}`);
         }
     }
@@ -484,43 +466,74 @@ async function callReplicateSAMWithMultipleClicks(clickPoints) {
     const result = await pollForResult(prediction.id);
 
     if (result.status === 'succeeded' && result.output) {
-        console.log('SAM 2 succeeded, output:', JSON.stringify(result.output, null, 2));
-
-        // SAM 2 output is typically an array of frame URLs or a single URL
-        let maskUrl = null;
-        const output = result.output;
-
-        if (Array.isArray(output)) {
-            // Output is an array of frame URLs - take the first one
-            console.log('Output is array with', output.length, 'items');
-            if (output.length > 0) {
-                maskUrl = output[0];
-                console.log('Using first frame:', maskUrl);
-            }
-        } else if (typeof output === 'object') {
-            // Output might be an object with fields
-            console.log('Output keys:', Object.keys(output));
-            // Try common field names
-            maskUrl = output.output || output.mask || output.frame || output.image;
-        } else if (typeof output === 'string') {
-            // Output is a single URL string
-            maskUrl = output;
-        }
-
-        if (maskUrl) {
-            console.log('Using mask URL:', maskUrl);
-            return await loadMaskImage(maskUrl);
-        } else {
-            console.error('Could not find mask image in output:', output);
-            throw new Error('No mask image found in response. Check console for output structure.');
-        }
+        return await processSAMOutput(result.output);
     } else {
-        console.error('SAM 2 failed:', result);
+        console.error('SAM failed:', result);
         throw new Error(result.error || 'Processing failed - could not segment object.');
     }
 }
 
-async function pollForResult(predictionId, maxAttempts = 60) {
+// Process SAM output - returns array of mask images
+// Grounded SAM returns a single mask URL based on text prompt
+async function processSAMOutput(output) {
+    console.log('Grounded SAM output:', typeof output === 'string' ? output.substring(0, 200) : JSON.stringify(output, null, 2));
+
+    let maskUrls = [];
+
+    // Grounded SAM typically returns a single mask URL as a string
+    if (typeof output === 'string' && output.startsWith('http')) {
+        maskUrls = [output];
+    } else if (typeof output === 'object' && output !== null) {
+        console.log('Output keys:', Object.keys(output));
+
+        // Check for common output formats
+        if (Array.isArray(output)) {
+            maskUrls = output.filter(item => typeof item === 'string' && item.startsWith('http'));
+        } else if (output.mask) {
+            maskUrls = [output.mask];
+        } else if (output.masks && Array.isArray(output.masks)) {
+            maskUrls = output.masks;
+        } else if (output.output) {
+            // Some models wrap result in 'output' key
+            if (typeof output.output === 'string' && output.output.startsWith('http')) {
+                maskUrls = [output.output];
+            }
+        } else {
+            // Look for any URL-like values
+            for (const key of Object.keys(output)) {
+                const val = output[key];
+                if (typeof val === 'string' && val.startsWith('http')) {
+                    console.log(`Found URL in key "${key}": ${val.substring(0, 80)}...`);
+                    maskUrls.push(val);
+                } else if (Array.isArray(val)) {
+                    val.forEach((item, i) => {
+                        if (typeof item === 'string' && item.startsWith('http')) {
+                            console.log(`Found URL in ${key}[${i}]: ${item.substring(0, 80)}...`);
+                            maskUrls.push(item);
+                        }
+                    });
+                }
+            }
+        }
+    } else if (Array.isArray(output)) {
+        console.log('Output is array with', output.length, 'items');
+        maskUrls = output.filter(item => typeof item === 'string' && item.startsWith('http'));
+    }
+
+    if (maskUrls.length === 0) {
+        console.error('Could not find mask URLs in output:', output);
+        throw new Error('No mask images found in response. The text prompt may not have matched any objects in the image.');
+    }
+
+    console.log(`Found ${maskUrls.length} mask URL(s):`, maskUrls.map(u => u.substring(0, 60) + '...'));
+
+    // Load all mask images
+    const maskImages = await Promise.all(maskUrls.map(url => loadMaskImage(url)));
+
+    return maskImages;
+}
+
+async function pollForResult(predictionId, maxAttempts = 120) {
     const baseUrl = `https://api.replicate.com/v1/predictions/${predictionId}`;
 
     for (let i = 0; i < maxAttempts; i++) {
@@ -550,8 +563,15 @@ async function pollForResult(predictionId, maxAttempts = 60) {
         // Wait before polling again
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // Update loading text
-        showLoading(true, `AI analyzing... (${i + 1}s)`);
+        // Update loading text based on status
+        if (result.status === 'starting') {
+            // Model is cold-starting (can take 30-60s on first run)
+            showLoading(true, `Starting AI model... (${i + 1}s)\nFirst run may take up to 2 minutes`);
+        } else if (result.status === 'processing') {
+            showLoading(true, `Analyzing image... (${i + 1}s)`);
+        } else {
+            showLoading(true, `AI working... (${i + 1}s)`);
+        }
     }
 
     throw new Error('Processing timeout - please try again');
@@ -562,13 +582,16 @@ async function loadMaskImage(maskUrl) {
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.onload = () => resolve(img);
-        img.onerror = reject;
+        img.onerror = (e) => {
+            console.error('Failed to load mask image:', maskUrl, e);
+            reject(new Error('Failed to load mask image'));
+        };
         img.src = maskUrl;
     });
 }
 
 // ============= MASK MANAGEMENT =============
-function addMaskToSelection(maskImage, promptUsed = '') {
+async function addMaskToSelection(maskImage, promptUsed = '') {
     console.log('addMaskToSelection called with prompt:', promptUsed);
     console.log('Mask image dimensions:', maskImage.width, 'x', maskImage.height);
     console.log('Canvas dimensions:', maskCanvas.width, 'x', maskCanvas.height);
@@ -585,6 +608,35 @@ function addMaskToSelection(maskImage, promptUsed = '') {
     // Get mask data
     const maskData = tempCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
 
+    // First pass: count bright vs dark pixels to detect if mask needs inversion
+    // If more than 60% of the image is "selected", the mask is likely inverted
+    let brightPixels = 0;
+    let darkPixels = 0;
+    const totalPixels = maskData.data.length / 4;
+
+    for (let i = 0; i < maskData.data.length; i += 4) {
+        const r = maskData.data[i];
+        const g = maskData.data[i + 1];
+        const b = maskData.data[i + 2];
+        const brightness = (r + g + b) / 3;
+
+        if (brightness > 128) {
+            brightPixels++;
+        } else {
+            darkPixels++;
+        }
+    }
+
+    const brightRatio = brightPixels / totalPixels;
+    console.log(`Mask analysis: ${(brightRatio * 100).toFixed(1)}% bright pixels`);
+
+    // If more than 60% is bright, the mask is probably inverted (selecting background)
+    // For architectural elements like "brick wall", we expect less than 60% of image
+    const shouldInvert = brightRatio > 0.6;
+    if (shouldInvert) {
+        console.log('Mask appears inverted (selecting background). Inverting...');
+    }
+
     // Apply mask with semi-transparent overlay
     const currentData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
 
@@ -597,12 +649,16 @@ function addMaskToSelection(maskImage, promptUsed = '') {
         const b = maskData.data[i + 2];
         const a = maskData.data[i + 3];
 
-        // RAM-Grounded-SAM mask has colored regions for different objects
-        // We want to detect ANY non-black pixel as part of the mask
-        // Black/near-black pixels are background (r,g,b all close to 0)
-        const isBackground = (r < 30 && g < 30 && b < 30) || a < 50;
+        // SAM mask: white/bright pixels = selected area, black/dark = background
+        const brightness = (r + g + b) / 3;
+        let isSelected = brightness > 128 || (a > 128 && brightness > 50);
 
-        if (!isBackground) {
+        // Invert selection if needed
+        if (shouldInvert) {
+            isSelected = !isSelected;
+        }
+
+        if (isSelected) {
             // Add to selection - red tint overlay
             currentData.data[i] = 122;     // R (ACL red)
             currentData.data[i + 1] = 5;   // G
@@ -618,7 +674,18 @@ function addMaskToSelection(maskImage, promptUsed = '') {
 
     console.log(`Mask applied: ${pixelsAdded} pixels added, ${pixelsSkipped} skipped`);
 
-    // Store mask for later use
+    // Store mask for later use (store the corrected version)
+    // If we inverted, we need to store the inverted mask
+    if (shouldInvert) {
+        // Create inverted mask for storage
+        for (let i = 0; i < maskData.data.length; i += 4) {
+            maskData.data[i] = 255 - maskData.data[i];
+            maskData.data[i + 1] = 255 - maskData.data[i + 1];
+            maskData.data[i + 2] = 255 - maskData.data[i + 2];
+        }
+        tempCtx.putImageData(maskData, 0, 0);
+    }
+
     selectedAreas.push({
         type: 'add',
         prompt: promptUsed,
@@ -668,6 +735,161 @@ function saveMaskToHistory() {
     }
 }
 
+// ============= MASK SELECTION UI =============
+// When SAM returns multiple masks, let the user pick which one is correct
+let pendingMaskPrompt = '';
+
+function showMaskSelectionUI(masks, prompt, labels = null) {
+    pendingMaskPrompt = prompt;
+
+    // Create or get the mask selection modal
+    let modal = document.getElementById('mask-selection-modal');
+    if (!modal) {
+        modal = createMaskSelectionModal();
+        document.body.appendChild(modal);
+    }
+
+    // Update the description
+    const desc = modal.querySelector('p');
+    if (desc) {
+        desc.textContent = `Click on the option that best matches the "${prompt}" you want to select:`;
+    }
+
+    // Populate with mask previews (show first 8 masks)
+    const grid = modal.querySelector('.mask-grid');
+    grid.innerHTML = '';
+
+    const masksToShow = masks.slice(0, 8);
+
+    masksToShow.forEach((maskImg, index) => {
+        const item = document.createElement('div');
+        item.className = 'mask-option';
+        item.dataset.index = index;
+
+        // Create composite preview: original image with mask overlay
+        const canvas = document.createElement('canvas');
+        canvas.width = 200;
+        canvas.height = 120;
+        const ctx = canvas.getContext('2d');
+
+        // Draw original image scaled
+        if (uploadedImage) {
+            ctx.drawImage(uploadedImage, 0, 0, 200, 120);
+        }
+
+        // Create a temp canvas to process the mask with red tint
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 200;
+        tempCanvas.height = 120;
+        const tempCtx = tempCanvas.getContext('2d');
+        tempCtx.drawImage(maskImg, 0, 0, 200, 120);
+
+        // Get mask data and apply red tint
+        const maskData = tempCtx.getImageData(0, 0, 200, 120);
+        for (let i = 0; i < maskData.data.length; i += 4) {
+            const brightness = (maskData.data[i] + maskData.data[i+1] + maskData.data[i+2]) / 3;
+            if (brightness > 128) {
+                // Apply red overlay on selected areas
+                ctx.fillStyle = 'rgba(122, 5, 5, 0.5)';
+            }
+        }
+
+        // Draw mask with red overlay
+        ctx.globalCompositeOperation = 'source-over';
+        tempCtx.globalCompositeOperation = 'source-in';
+        tempCtx.fillStyle = 'rgba(122, 5, 5, 0.6)';
+        tempCtx.fillRect(0, 0, 200, 120);
+        ctx.drawImage(tempCanvas, 0, 0);
+
+        item.appendChild(canvas);
+
+        // Add label
+        const label = document.createElement('span');
+        label.textContent = labels && labels[index] ? labels[index] : `Option ${index + 1}`;
+        item.appendChild(label);
+
+        // Click handler
+        item.addEventListener('click', () => selectMaskOption(index));
+
+        grid.appendChild(item);
+    });
+
+    // Adjust grid columns based on number of masks
+    if (masksToShow.length <= 3) {
+        grid.style.gridTemplateColumns = `repeat(${masksToShow.length}, 1fr)`;
+    } else {
+        grid.style.gridTemplateColumns = 'repeat(4, 1fr)';
+    }
+
+    modal.classList.remove('hidden');
+}
+
+function createMaskSelectionModal() {
+    const modal = document.createElement('div');
+    modal.id = 'mask-selection-modal';
+    modal.className = 'modal';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width: 700px;">
+            <h2>Select the Correct Area</h2>
+            <p>The AI detected multiple areas. Click the one that matches "${pendingMaskPrompt}":</p>
+            <div class="mask-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0;"></div>
+            <div class="modal-actions">
+                <button class="btn-secondary" id="mask-select-cancel">Cancel</button>
+            </div>
+        </div>
+    `;
+
+    // Add styles for mask options
+    const style = document.createElement('style');
+    style.textContent = `
+        .mask-option {
+            cursor: pointer;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-radius: 8px;
+            overflow: hidden;
+            transition: all 0.2s;
+            text-align: center;
+        }
+        .mask-option:hover {
+            border-color: var(--acl-red);
+            transform: scale(1.02);
+        }
+        .mask-option canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+        .mask-option span {
+            display: block;
+            padding: 6px;
+            font-size: 12px;
+            color: rgba(255,255,255,0.7);
+            background: rgba(0,0,0,0.3);
+        }
+    `;
+    document.head.appendChild(style);
+
+    // Cancel button handler
+    modal.querySelector('#mask-select-cancel').addEventListener('click', () => {
+        modal.classList.add('hidden');
+    });
+
+    return modal;
+}
+
+async function selectMaskOption(index) {
+    const modal = document.getElementById('mask-selection-modal');
+    if (modal) modal.classList.add('hidden');
+
+    if (availableMasks[index]) {
+        saveMaskToHistory();
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        await addMaskToSelection(availableMasks[index], pendingMaskPrompt);
+        updateAreasPanel();
+        updateContinueButton();
+    }
+}
+
 function undoLastAction() {
     if (maskHistory.length === 0 && currentClickPoints.length === 0) return;
 
@@ -708,7 +930,7 @@ function clearAllSelections() {
     maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
     selectedAreas = [];
     currentClickPoints = []; // Reset click points
-    videoDataUrlCache = null; // Clear video cache
+    availableMasks = []; // Clear stored masks
     updateAreasPanel();
     updateContinueButton();
 }
@@ -788,17 +1010,31 @@ function updateContinueButton() {
 // ============= API KEY MODAL =============
 function setupModalListeners() {
     document.getElementById('btn-save-api')?.addEventListener('click', () => {
-        const input = document.getElementById('api-key-input');
-        if (input && input.value.trim()) {
-            apiKey = input.value.trim();
+        const falInput = document.getElementById('fal-api-key-input');
+        const replicateInput = document.getElementById('api-key-input');
+
+        // Save fal.ai key if provided
+        if (falInput && falInput.value.trim()) {
+            falApiKey = falInput.value.trim();
+            localStorage.setItem('fal_api_key', falApiKey);
+        }
+
+        // Save Replicate key if provided
+        if (replicateInput && replicateInput.value.trim()) {
+            apiKey = replicateInput.value.trim();
             localStorage.setItem('replicate_api_key', apiKey);
+        }
+
+        // Need at least one key
+        if (falApiKey || apiKey) {
             document.getElementById('api-modal')?.classList.add('hidden');
+        } else {
+            alert('Please enter at least one API key to use AI features.');
         }
     });
 
     document.getElementById('btn-skip-api')?.addEventListener('click', () => {
         document.getElementById('api-modal')?.classList.add('hidden');
-        alert('Manual mode: You can draw selections manually, but AI auto-detection is disabled.');
     });
 }
 
@@ -916,7 +1152,7 @@ function resetEditor() {
     selectedAreas = [];
     maskHistory = [];
     currentClickPoints = []; // Reset click points
-    videoDataUrlCache = null; // Clear video cache
+    availableMasks = []; // Clear stored masks
 
     if (maskCtx) {
         maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
@@ -983,20 +1219,9 @@ function setupPromptDialog() {
         hidePromptDialog();
     });
 
-    // Auto-detect button - now explains click-based workflow
+    // Auto-detect button - opens prompt dialog
     document.getElementById('auto-detect-btn')?.addEventListener('click', () => {
-        // Show instructions for click-based workflow
-        alert('Refine Your Selection:\n\n' +
-            'LEFT CLICK (green) = Add to selection\n' +
-            '• Click on the wall or area you want\n' +
-            '• Add more clicks to expand the selection\n\n' +
-            'RIGHT CLICK (red) = Remove from selection\n' +
-            '• Click on grass, sky, or other areas to exclude\n' +
-            '• The AI will refine the mask with each click\n\n' +
-            'TIPS:\n' +
-            '• Start with one click on the main area\n' +
-            '• Use right-clicks to remove unwanted areas\n' +
-            '• Use Undo to remove the last click');
+        showPromptDialog();
     });
 }
 
