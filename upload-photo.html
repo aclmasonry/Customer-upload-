@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Your Photo - Stone Visualizer</title>
+    <link rel="stylesheet" href="upload-photo.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-left">
+                <a href="choose-sample.html" class="back-link">← Back to Samples</a>
+            </div>
+            <div class="header-center">
+                <h1 class="app-title">STONE VISUALIZER</h1>
+            </div>
+            <div class="header-right">
+                <span class="beta-badge">AI Beta</span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Step 1: Upload -->
+            <div class="step-container" id="step-upload">
+                <div class="step-header">
+                    <div class="step-number">1</div>
+                    <h2>Upload Your Photo</h2>
+                    <p>Upload a photo of your home's exterior to visualize different stone and brick options</p>
+                </div>
+
+                <div class="upload-zone" id="upload-zone">
+                    <input type="file" id="file-input" accept="image/*" hidden>
+                    <div class="upload-icon">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                    </div>
+                    <p class="upload-text">Drag & drop your photo here</p>
+                    <p class="upload-subtext">or click to browse</p>
+                    <p class="upload-formats">Supports: JPG, PNG (Max 10MB)</p>
+                </div>
+
+                <div class="upload-tips">
+                    <h3>Tips for best results:</h3>
+                    <ul>
+                        <li>Use a clear, well-lit photo taken during daytime</li>
+                        <li>Capture the full area you want to visualize</li>
+                        <li>Avoid photos with heavy shadows or obstructions</li>
+                        <li>Higher resolution photos work better</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Step 2: Select Areas -->
+            <div class="step-container hidden" id="step-select">
+                <div class="step-header">
+                    <div class="step-number">2</div>
+                    <h2>Select Stone Areas</h2>
+                    <p>Left-click to add areas, right-click to remove. The AI refines with each click.</p>
+                </div>
+
+                <div class="editor-container">
+                    <div class="canvas-wrapper">
+                        <canvas id="photo-canvas"></canvas>
+                        <canvas id="mask-canvas"></canvas>
+                        <div class="click-indicator" id="click-indicator"></div>
+                    </div>
+
+                    <div class="editor-toolbar">
+                        <div class="tool-group">
+                            <h4 class="tool-group-title">Click to Select</h4>
+                            <button class="tool-btn primary" id="auto-detect-btn" title="How to use click selection">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="3"/>
+                                    <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+                                </svg>
+                                <span>How It Works</span>
+                            </button>
+                            <div class="tool-hint" style="font-size: 11px; color: rgba(255,255,255,0.5); padding: 8px 0; line-height: 1.5;">
+                                <div style="margin-bottom: 6px;"><span style="color: #4CAF50;">Left click</span> = Add to selection</div>
+                                <div><span style="color: #f44336;">Right click</span> = Remove from selection</div>
+                            </div>
+                        </div>
+                        <div class="tool-group">
+                            <h4 class="tool-group-title">Edit Selection</h4>
+                            <button class="tool-btn" id="tool-clear" title="Clear all selections">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                </svg>
+                                <span>Clear All</span>
+                            </button>
+                            <button class="tool-btn" id="tool-undo" title="Undo last action">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M3 7v6h6"/>
+                                    <path d="M3 13a9 9 0 1 0 3-7.7L3 7"/>
+                                </svg>
+                                <span>Undo</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="areas-panel">
+                        <h3>Selected Areas</h3>
+                        <div class="areas-list" id="areas-list">
+                            <p class="no-areas">Click on the image to select walls, pillars, or stone areas</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step-actions">
+                    <button class="btn-secondary" id="btn-back-upload">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M19 12H5M12 19l-7-7 7-7"/>
+                        </svg>
+                        Upload Different Photo
+                    </button>
+                    <button class="btn-primary" id="btn-continue" disabled>
+                        Continue to Visualizer
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M5 12h14M12 5l7 7-7 7"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Loading Overlay -->
+            <div class="loading-overlay hidden" id="loading-overlay">
+                <div class="loading-content">
+                    <div class="loading-spinner"></div>
+                    <p class="loading-text" id="loading-text">Analyzing image...</p>
+                    <p class="loading-subtext">Our AI is detecting the area you selected</p>
+                </div>
+            </div>
+        </main>
+
+        <!-- API Key Modal (for demo/setup) -->
+        <div class="modal hidden" id="api-modal">
+            <div class="modal-content">
+                <h2>Setup Required</h2>
+                <p>To use AI-powered segmentation, you need a Replicate API key.</p>
+                <ol>
+                    <li>Go to <a href="https://replicate.com" target="_blank">replicate.com</a> and create an account</li>
+                    <li>Navigate to Account Settings → API Tokens</li>
+                    <li>Create a new token and paste it below</li>
+                </ol>
+                <input type="text" id="api-key-input" placeholder="Enter your Replicate API token">
+                <p class="api-note">Your key is stored locally and never shared.</p>
+                <div class="modal-actions">
+                    <button class="btn-secondary" id="btn-skip-api">Use Manual Mode</button>
+                    <button class="btn-primary" id="btn-save-api">Save & Continue</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Prompt Dialog for Custom Area Selection -->
+        <div class="modal hidden" id="prompt-modal">
+            <div class="modal-content prompt-modal-content">
+                <h2>What would you like to select?</h2>
+                <p>Describe the area you want to apply stone or brick to:</p>
+
+                <div class="quick-prompts">
+                    <h4>Quick Select:</h4>
+                    <div class="quick-prompt-grid">
+                        <button class="quick-prompt-btn" data-prompt="stone wall">Stone Wall</button>
+                        <button class="quick-prompt-btn" data-prompt="brick wall">Brick Wall</button>
+                        <button class="quick-prompt-btn" data-prompt="house exterior">House Exterior</button>
+                        <button class="quick-prompt-btn" data-prompt="building facade">Building Facade</button>
+                        <button class="quick-prompt-btn" data-prompt="fireplace">Fireplace</button>
+                        <button class="quick-prompt-btn" data-prompt="accent wall">Accent Wall</button>
+                        <button class="quick-prompt-btn" data-prompt="chimney">Chimney</button>
+                        <button class="quick-prompt-btn" data-prompt="pillar, column">Pillars/Columns</button>
+                    </div>
+                </div>
+
+                <div class="custom-prompt">
+                    <h4>Or type your own:</h4>
+                    <div class="prompt-input-row">
+                        <input type="text" id="prompt-input" placeholder="e.g., front porch wall, garage exterior...">
+                        <button class="btn-primary" id="prompt-submit">Detect</button>
+                    </div>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn-secondary" id="prompt-cancel">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="upload-photo.js"></script>
+</body>
+</html>
