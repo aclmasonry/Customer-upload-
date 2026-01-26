@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -61,7 +62,7 @@
                 <div class="step-header">
                     <div class="step-number">2</div>
                     <h2>Select Stone Areas</h2>
-                    <p>Left-click to add areas, right-click to remove. The AI refines with each click.</p>
+                    <p>Click the image or use the buttons below to describe what you want to select</p>
                 </div>
 
                 <div class="editor-container">
@@ -73,17 +74,16 @@
 
                     <div class="editor-toolbar">
                         <div class="tool-group">
-                            <h4 class="tool-group-title">Click to Select</h4>
-                            <button class="tool-btn primary" id="auto-detect-btn" title="How to use click selection">
+                            <h4 class="tool-group-title">AI Selection</h4>
+                            <button class="tool-btn primary" id="auto-detect-btn" title="Select what to segment">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <circle cx="12" cy="12" r="3"/>
-                                    <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <path d="M21 21l-4.35-4.35"/>
                                 </svg>
-                                <span>How It Works</span>
+                                <span>Select Area</span>
                             </button>
                             <div class="tool-hint" style="font-size: 11px; color: rgba(255,255,255,0.5); padding: 8px 0; line-height: 1.5;">
-                                <div style="margin-bottom: 6px;"><span style="color: #4CAF50;">Left click</span> = Add to selection</div>
-                                <div><span style="color: #f44336;">Right click</span> = Remove from selection</div>
+                                Click the image or button above to describe what you want to select (e.g., "brick wall", "stone pillar")
                             </div>
                         </div>
                         <div class="tool-group">
@@ -141,17 +141,24 @@
         <!-- API Key Modal (for demo/setup) -->
         <div class="modal hidden" id="api-modal">
             <div class="modal-content">
-                <h2>Setup Required</h2>
-                <p>To use AI-powered segmentation, you need a Replicate API key.</p>
-                <ol>
-                    <li>Go to <a href="https://replicate.com" target="_blank">replicate.com</a> and create an account</li>
-                    <li>Navigate to Account Settings → API Tokens</li>
-                    <li>Create a new token and paste it below</li>
-                </ol>
-                <input type="text" id="api-key-input" placeholder="Enter your Replicate API token">
-                <p class="api-note">Your key is stored locally and never shared.</p>
+                <h2>AI Setup</h2>
+                <p>Enter an API key to enable AI-powered area selection:</p>
+
+                <div class="api-option" style="margin-bottom: 16px;">
+                    <h4 style="color: white; margin-bottom: 8px;">Option 1: fal.ai (Recommended - Fast & Accurate)</h4>
+                    <p style="font-size: 12px; margin-bottom: 8px;">Text-to-segment with Florence-SAM. Get key from <a href="https://fal.ai/dashboard/keys" target="_blank">fal.ai/dashboard/keys</a></p>
+                    <input type="text" id="fal-api-key-input" placeholder="Enter fal.ai API key">
+                </div>
+
+                <div class="api-option">
+                    <h4 style="color: white; margin-bottom: 8px;">Option 2: Replicate (Backup)</h4>
+                    <p style="font-size: 12px; margin-bottom: 8px;">Auto-segmentation with SAM-2. Get key from <a href="https://replicate.com/account/api-tokens" target="_blank">replicate.com</a></p>
+                    <input type="text" id="api-key-input" placeholder="Enter Replicate API token">
+                </div>
+
+                <p class="api-note" style="margin-top: 12px;">Keys are stored locally and never shared.</p>
                 <div class="modal-actions">
-                    <button class="btn-secondary" id="btn-skip-api">Use Manual Mode</button>
+                    <button class="btn-secondary" id="btn-skip-api">Cancel</button>
                     <button class="btn-primary" id="btn-save-api">Save & Continue</button>
                 </div>
             </div>
